@@ -28,7 +28,7 @@ The script requires the `lockfile` library from https://github.com/infogrind/rub
 
 # Disclaimer
 
-- The script was developed previous to Ruby 1.9 and has not been tested with
+- The script was developed prior to Ruby 1.9 and has not been tested with
   newer Ruby versions.
 - This is for illustration purposes only. Be aware of your local copyright laws
   before downloading or sharing any material on the internet.
