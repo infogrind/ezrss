@@ -1,6 +1,6 @@
 # Introduction
 
-This script was originally been written as an exercise in Ruby, to create a
+This script was originally written as an exercise in Ruby, to create a
 slightly complex script. Its purpose was to monitor RSS feeds on [eztv.it](http://eztv.it) for Torrent links
 to new episodes of TV shows. (The website may no longer be available, at least not in its original form.)
 
