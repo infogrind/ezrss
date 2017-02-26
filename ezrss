@@ -1,0 +1,481 @@
+#!/usr/bin/ruby
+#
+# TODO:
+# - Implement specification of shows in config file (right now the shows are
+#   hardcoded)
+# - If there is a PROPER release, it should be downloaded even if the same
+#   episode has already been downloaded. For this, the downloaded episodes
+#   should somehow be marked, because even a proper release should only be
+#   downloaded once.
+
+require 'optparse'
+require 'pathname'
+require 'rss/1.0'
+require 'rss/2.0'
+require 'cgi'
+require 'mk/lockfile'
+require 'net/smtp'
+
+# Default options
+$options = {
+    'downloaddir'    => "#{ENV['HOME']}/torrents",
+    'datafile'   => "episodes.txt",
+    'showfile'   => "#{ENV['HOME']}/.ezrssshows",
+    'configfile' => (Pathname.new(ENV['HOME']) +
+                     Pathname.new('.ezrssrc')).to_s,
+    'verbose'   => false,
+    'quiet'     => false,
+    'catchup'   => false,
+    'dlcommand' => 'wget -O "$DLDEST" "$DLURL"',
+    'sink'      => '> /dev/null 2>&1',
+    'lockfile'  => 'ezrss.lock',
+    'notify'   => 'false',
+    'owner'     => 'someemailaddress@someserver1234.net',
+    'notifyemail' => 'someemailaddress@someserver1234.net',
+    'smtpserver'=> 'localhost',
+    'ezrsshost' => 'ezrss.it',
+    'ezrsspath' => '/search/index.php'
+}
+
+def make_option_parser
+    opts = OptionParser.new
+    opts.on("-v", "--verbose") {|val| $options['verbose'] = true}
+    opts.on("-q", "--quiet") {|val| $options['quiet'] = true}
+    opts.on("-d", "--datafile VAL", String) do |val|
+        $options['datafile'] = val
+    end
+    opts.on("-o", "--outdir VAL", String) do |val|
+        $options['downloaddir'] = val
+    end
+    opts.on("-c", "--config VAL", String) do |val|
+        $options['configfile'] = val
+    end
+    opts.on("-O", "--owner VAL", String) do |val|
+        $options['owner'] = val
+    end
+    opts.on("--showfile VAL", String) { |val| $options['showfile'] = val }
+    opts.on("--catchup") { |val| $options['catchup'] = true }
+    opts.on("-n", "--notify") { |val| $options['notify'] = true }
+    opts.on("-h", "--help") { |val| usage(); exit(1) }
+
+    opts
+end
+
+def usage
+    $stderr.puts(make_option_parser().to_s)
+end
+
+def shell_expand(s)
+    `echo #{s}`.chomp
+end
+
+def parse_options
+    def read_config_file
+        def parse_config_line(line, i)
+            debug("Parsing line '#{line}'")
+            # Strip comments
+            line.sub!(/#.*$/, '')
+
+            case line
+            when /^\s*$/
+                # do nothing
+            when /^\s*([^\s]*)\s*=\s*([^\s]*)\s*$/
+                set_option($1, shell_expand($2), i)
+            else
+                warning "Line #{i}: Malformed option '#{line}'"
+            end
+        end
+
+        def set_option(name, val, i)
+            if $options[name]
+                $options[name] = val
+            else
+                warning("Line #{i}: unknown option '#{name}'")
+            end
+        end
+
+        if File.exist?($options['configfile'])
+            debug("Opening config file #{$options['configfile']}")
+            File.open($options['configfile'], "r") do |file|
+                file.each_line do |line|
+                    parse_config_line(line.chomp, file.lineno)
+                end
+            end
+        else
+            debug "File #{$options['configfile']} doesn't exist"
+        end
+    end
+
+    opts = make_option_parser
+
+    # We read the command line arguments twice, once before and once after the
+    # configuration file is read. This ensures on one hand that options such as
+    # verbosity or the configuration file name are parsed before the config file
+    # is read, and on the other hand that the command line options still have
+    # precedence over the config file.
+    opts.parse(*ARGV)
+    read_config_file()
+    opts.parse(*ARGV)
+end
+
+
+
+# Debug info display routine
+def debug(msg)
+    $stderr.puts("DEBUG: #{msg}") if $options['verbose']
+end
+
+# Print a message to stdout unless quiet mode is enabled.
+def message(msg)
+    $stdout.puts(msg) unless $options['quiet']
+end
+
+# Print a warning message
+def warning(msg) $stderr.puts("Warning: #{msg}") end
+
+# Print an error message
+def error(msg) $stderr.puts("Error: #{msg}") end
+
+class EpisodeList < Array
+    def EpisodeList::from_file(file)
+        el = EpisodeList.new()
+        # Read episode list from specified file
+        open(file, "r") do |fin|
+            while line = fin.gets
+                line.chomp!
+                begin
+                    el.push(Episode.from_s(line))
+                rescue ArgumentError
+                    warning "Invalid episode line in file: #{line}"
+                end
+            end
+        end
+
+        el
+    end
+
+    def save(filename)
+        open(filename, "w") do |fout|
+            self.sort.each { |ep| fout.puts(ep.short_s) }
+        end
+    end
+
+    def to_s
+        s = StringIO.new
+        self.each { |e| s << (e.to_s + "\n") }
+        s.string
+    end
+end
+
+class Episode
+    include Comparable
+
+    attr_reader :showname, :season, :episode
+
+    def initialize(showname, season, episode)
+        @showname = showname
+        @season = season
+        @episode = episode
+    end
+
+    def Episode::from_episode(ep)
+        Episode.new(ep.showname, ep.season, ep.episode)
+    end
+
+    def <=>(other)
+        # Lexical sort for show name, then inverse numerical sort for episodes
+        # and season.
+        if @showname == other.showname
+            if @season == other.season
+                if @episode == other.episode
+                    # All equal
+                    0
+                else
+                    -1 * (@episode <=> other.episode)
+                end
+            else
+                -1 * (@season <=> other.season)
+            end
+        else
+            @showname <=> other.showname
+        end
+    end
+
+    def short_s
+        "#@showname;#@season;#@episode"
+    end
+
+    def to_s
+        "#@showname, Episode #{@season}x#{@episode}"
+    end
+
+    def Episode::from_s(s)
+        unless s =~ /(.*);(\d*);(\d*)/
+            raise ArgumentError, "Invalid episode string: #{s}"
+        end
+        Episode.new($1, $2.to_i, $3.to_i)
+    end
+end
+
+class RemoteEpisode < Episode
+    attr_reader :link
+    def initialize(showname, season, episode, link)
+        super(showname, season, episode)
+        @link = link
+    end
+end
+
+class TVShow
+    attr_reader :name, :quality
+
+    def initialize(name, quality)
+        @name = name
+        @quality = quality
+        @rss = rss_feed()
+        if @rss.items.length == 0
+            raise NoItemsFoundError
+        end
+    end
+
+    def episodes
+        eps = []
+        @rss.items.each do |item|
+            if item.description =~ /Season: (\d*).*Episode: (\d*)/
+                eps.push(RemoteEpisode.new(@name, $1.to_i, $2.to_i, item.link))
+            else
+                warning "Unknown item in RSS feed: #{item.description}"
+            end
+        end
+
+        eps
+    end
+
+    private
+    def ezrssurl
+        "http://#{$options['ezrsshost']}#{$options['ezrsspath']}?" + 
+            "show_name=" + CGI::escape(@name) + "&show_name_exact=true&date=&" +
+            "quality=" + CGI::escape(@quality) + "&release_group=&mode=rss"
+    end
+
+    def rss_feed
+        content = ""
+        open(ezrssurl()) { |s| content = s.read }
+        RSS::Parser.parse(content, false)
+    end
+end
+
+# Need to use this alternative download method because the Ruby-internal methods
+# using URIs complain about the square brackets in the torrent URLs.
+def download_file(url, dest)
+    ENV['DLURL'] = url
+    ENV['DLDEST'] = dest
+    retval = $options['verbose'] ? 
+        system($options['dlcommand']) :
+        system($options['dlcommand'] + $options['sink'])
+
+    unless retval
+        debug("System download command returned error: #$?")
+        raise CouldNotDownloadError, "#{url} (#$?)", caller
+    end
+end
+
+def url_basename(url)
+    b = url.sub(/.*\/([^\/]*)/, '\1')
+end
+
+def dl_target(url)
+    b = url_basename(url)
+
+    (Pathname.new($options['downloaddir']) + Pathname.new(b)).to_s
+end
+
+def process_show(show)
+
+    # List of downloaded episodes for this show.
+    eplist = EpisodeList.new();
+
+    begin
+        message "Downloading RSS feed for #{show[:name]}"
+        tvshow = TVShow.new(show[:name], show[:quality])
+    rescue NoItemsFoundError
+        warning "No items found for show #{show[:name]}."
+        return eplist
+    end
+
+    tvshow.episodes().each do |ep|
+        if $el.find { |localep| ep == localep }
+            debug "Remote episode #{ep.to_s} already downloaded"
+        else
+            debug "Remote episode #{ep.to_s} not yet downloaded"
+            begin
+                unless $options['catchup']
+                    debug "Downloading '#{ep.link}' to '#{dl_target(ep.link)}'"
+                    message "Downloading #{ep}"
+                    download_file(ep.link, dl_target(ep.link))
+                    eplist << ep
+                else
+                    message "Marking '#{ep}' as downloaded."
+                    debug "Skipping download in catchup mode."
+                end
+                $el.push(Episode.from_episode(ep))
+            rescue CouldNotDownloadError
+                warning "Could not download torrent file for #{ep}"
+            end
+        end
+    end
+
+    return eplist
+end
+
+def init()
+    unless File.directory?($options['downloaddir'])
+        raise NoDownloadDirectoryError, $options['downloaddir'], caller
+    end
+
+    unless File.exist?($options['datafile'])
+        #raise DatafileNotFoundError, $options['datafile'], caller
+        # Create empty file
+        debug "Datafile #{$options['datafile']} does not exist, creating it."
+        open($options['datafile'], "w") do |fout|
+            # we do nothing
+        end
+    end
+
+    $el = EpisodeList.from_file($options['datafile'])
+end
+
+def parse_show_file()
+    begin
+        s = eval(File.read($options['showfile']))
+    rescue SyntaxError
+        raise ShowFileSyntaxError, $options['showfile'], caller
+    rescue SystemCallError
+        raise ShowFileReadError, $!.to_s, caller
+    end
+
+    return s
+end
+
+def send_email(from, from_alias, to, to_alias, subject, message)
+    msg = <<EOM
+From: #{from_alias} <#{from}>
+To: #{to_alias} <#{to}>
+Subject: #{subject}
+
+#{message}
+EOM
+    
+    Net::SMTP.start($options['smtpserver']) do |smtp|
+        smtp.send_message msg, from, to
+    end
+end
+
+def notify(eplist)
+    msg = <<EOT
+Dear User,
+
+Bittorrent files for new episodes of your favorite shows have been downloaded:
+#{eplist.sort.to_s}
+
+Best,
+The ezrss script at #{`hostname`}
+EOT
+
+    begin
+        send_email($options['notifyemail'], "ezrss script",
+                   $options['owner'], "", 
+                   "New torrent files downloaded", msg)
+    rescue SystemCallError
+        raise NotificationError
+    end
+end
+
+# Error categories
+class DatafileNotFoundError < RuntimeError
+end
+
+class NoDownloadDirectoryError < RuntimeError
+end
+
+class CouldNotDownloadError < RuntimeError
+end
+
+class ShowFileReadError < RuntimeError
+end
+
+class ShowFileSyntaxError < RuntimeError
+end
+
+class NoItemsFoundError < RuntimeError
+end
+
+class NotificationError < RuntimeError
+end
+
+
+# Main code begins here
+
+begin
+    parse_options()
+rescue OptionParser::InvalidOption, OptionParser::MissingArgument
+    $stderr.puts "Syntax error"
+    usage()
+    exit(1)
+end
+
+lock = MK::Lockfile.new($options['lockfile'])
+unless lock.lock()
+    debug "There is already an instance running, stopping."
+    exit(2)
+end
+
+begin
+    init()
+    shows = parse_show_file()
+    begin
+        message "Catchup mode enabled, not downloading anything." if 
+        $options['catchup']
+        downloaded_episodes = EpisodeList.new()
+
+        # For each show, download new episodes and add the downloaded episodes
+        # to the list.
+        shows.each { |show| downloaded_episodes.concat(process_show(show)) }
+        if $options['notify'] and not downloaded_episodes.empty?
+            message "Sending notification message"
+            notify(downloaded_episodes)
+        end
+
+        message "No new episodes." if downloaded_episodes.empty?
+    ensure
+        # Save the episode list
+        if $el then
+            begin
+                $el.save($options['datafile'])
+            rescue StandardError
+                error("Could not save the episode list: #$!")
+            else
+                message "Saved episode list in #{$options['datafile']}."
+            end
+        end
+    end
+rescue DatafileNotFoundError
+    error("Datafile #$! not found.")
+    exit(1)
+rescue NoDownloadDirectoryError
+    error("Download directory '#$!' does not exist.")
+    exit(1)
+rescue ShowFileReadError
+    error("Could not read show file: #$!.")
+    exit(1)
+rescue NotificationError
+    error("Unable to send the notification e-mail.")
+    exit(1)
+rescue ShowFileSyntaxError
+    error("Syntax error while parsing show file #$!.")
+    exit(1)
+rescue Errno::ETIMEDOUT
+    error("Connection to server #{$options['ezrsshost']} timed out.")
+    exit(1)
+ensure
+    lock.unlock()
+end
